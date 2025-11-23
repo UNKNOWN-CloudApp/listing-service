@@ -1,6 +1,7 @@
 from typing import List, Optional
 from datetime import date
 from fastapi import FastAPI, Depends, HTTPException, Query, Path, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from mysql.connector import MySQLConnection
 from fastapi.encoders import jsonable_encoder
 
@@ -11,6 +12,14 @@ app = FastAPI(
     title="Listing Service",
     version="1.0.0",
     description="Listing microservice backed by MySQL",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # helpers
