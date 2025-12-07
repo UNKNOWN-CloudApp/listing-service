@@ -6,7 +6,7 @@ from mysql.connector import MySQLConnection
 from fastapi.encoders import jsonable_encoder
 
 from utils.database import get_db         
-from models.listing import ListingCreate, ListingRead  
+from models.listing import ListingCreate, ListingRead, ListingUpdate
 
 app = FastAPI(
     title="Listing Service",
@@ -24,37 +24,16 @@ app.add_middleware(
 
 # helpers
 def row_to_listing(row: dict) -> ListingRead:
-    """Convert a DB row dict from `listings` into a ListingRead Pydantic object."""
-    public_transport = (
-        row["public_transport_info"].split(",")
-        if row.get("public_transport_info")
-        else []
-    )
-
+    """Convert a DB row from `listings` into ListingRead."""
     return ListingRead(
         id=row["id"],
-        title=row["title"],
-        description=row["description"],
+        landlord_email=row["landlord_email"],
+        name=row["name"],
         address=row["address"],
-        city=row["city"],
-        state=row["state"],
-        zipcode=row["zipcode"],
-        distance_from_campus_km=float(row["distance_from_campus_km"]),
-        public_transportation=public_transport,
-        price_per_month=float(row["price_monthly"]),
-        available_from=row["available_from"],
-        available_to=row["available_to"],
-        room_type=row["room_type"],  # adjust if your enum uses different values
-        gender_neutral=bool(row["gender_neutral"]),
-        utilities_included=bool(row["utilities_included"]),
-        ac_heater_included=bool(row["ac_included"] or row["heater_included"]),
-        furnished=bool(row["furnished"]),
-        pet_allowed=bool(row["pets_allowed"]),
-        kitchen=bool(row["kitchen_available"]),
-        availability_status=row["availability_status"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        image_urls=[],  
+        start_date=row["start_date"],
+        end_date=row["end_date"],
+        description=row.get("description"),
+        picture_url=row.get("picture_url"),
     )
 
 @app.post("/listing", response_model=ListingRead, status_code=201)
@@ -62,103 +41,111 @@ def create_listing(
     payload: ListingCreate,
     db: MySQLConnection = Depends(get_db),
 ):
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-@app.get("/listing/{listing_id}")
-def get_listing_debug(
-    listing_id: int = Path(..., ge=1),
-    db: MySQLConnection = Depends(get_db),
-):
-    try:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
-        row = cursor.fetchone()
-        cursor.close()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Listing not found")
-
-        # Convert Decimal/date to JSON-friendly types
-        return jsonable_encoder(row)
-    except Exception as e:
-        print("ERROR in get_listing:", repr(e))
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
-
-
-@app.put("/listing/{listing_id}", response_model=ListingRead)
-def update_listing(
-    listing_id: int,
-    payload: ListingCreate,  # or a separate ListingUpdate model if you have one
-    db: MySQLConnection = Depends(get_db),
-):
-    # Ensure it exists
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
-    existing = cursor.fetchone()
-    cursor.close()
-
-    if not existing:
-        raise HTTPException(status_code=404, detail="Listing not found")
-
     cursor = db.cursor()
 
     sql = """
-        UPDATE listings
-        SET
-            title = %s,
-            description = %s,
-            address = %s,
-            city = %s,
-            state = %s,
-            zipcode = %s,
-            distance_from_campus_km = %s,
-            public_transport_info = %s,
-            price_monthly = %s,
-            available_from = %s,
-            available_to = %s,
-            room_type = %s,
-            gender_neutral = %s,
-            utilities_included = %s,
-            ac_included = %s,
-            heater_included = %s,
-            furnished = %s,
-            pets_allowed = %s,
-            kitchen_available = %s
-        WHERE id = %s
+        INSERT INTO listings (
+            landlord_email,
+            name,
+            address,
+            start_date,
+            end_date,
+            description,
+            picture_url
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
 
-    public_transport_info = ",".join(payload.public_transportation or [])
-
     values = (
-        payload.title,
-        payload.description,
+        payload.landlord_email,
+        payload.name,
         payload.address,
-        payload.city,
-        payload.state,
-        payload.zipcode,
-        payload.distance_from_campus_km,
-        public_transport_info,
-        payload.price_per_month,
-        payload.available_from,
-        payload.available_to,
-        payload.room_type,
-        payload.gender_neutral,
-        payload.utilities_included,
-        payload.ac_heater_included,
-        False,
-        payload.furnished,
-        payload.pet_allowed,
-        payload.kitchen,
-        listing_id,
+        payload.start_date,
+        payload.end_date,
+        payload.description,
+        str(payload.picture_url) if payload.picture_url else None,
     )
 
     cursor.execute(sql, values)
     db.commit()
+    new_id = cursor.lastrowid
     cursor.close()
 
-    return get_listing(listing_id, db)
+    # Fetch to return ListingRead
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM listings WHERE id = %s", (new_id,))
+    row = cursor.fetchone()
+    cursor.close()
 
+    return row_to_listing(row)
+
+from typing import List
+
+@app.get("/listing", response_model=List[ListingRead])
+async def search_listings(
+    # ---- filters (all optional) ----
+    landlord_email: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    address: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+
+    # ---- pagination ----
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+
+    db: MySQLConnection = Depends(get_db),
+):
+    sql = "SELECT * FROM listings WHERE 1=1"
+    params = []
+
+    # ---- dynamic filters ----
+    if landlord_email:
+        sql += " AND landlord_email = %s"
+        params.append(landlord_email)
+
+    if name:
+        sql += " AND name LIKE %s"
+        params.append(f"%{name}%")
+
+    if address:
+        sql += " AND address LIKE %s"
+        params.append(f"%{address}%")
+
+    if start_date:
+        sql += " AND start_date >= %s"
+        params.append(start_date)
+
+    if end_date:
+        # if you want open-ended listings to still show, you can drop the IS NULL part
+        sql += " AND (end_date IS NULL OR end_date <= %s)"
+        params.append(end_date)
+
+    # ---- pagination ----
+    offset = (page - 1) * page_size
+    sql += " ORDER BY id DESC LIMIT %s OFFSET %s"
+    params.extend([page_size, offset])
+
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(sql, tuple(params))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    return [row_to_listing(row) for row in rows]
+
+@app.get("/listing/user/{landlord_email}", response_model=List[ListingRead])
+def list_listings_by_landlord(
+    landlord_email: str,
+    db: MySQLConnection = Depends(get_db),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM listings WHERE landlord_email = %s", (landlord_email,)
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+
+    return [row_to_listing(r) for r in rows]
 
 @app.delete("/listing/{listing_id}")
 def delete_listing(
@@ -176,70 +163,21 @@ def delete_listing(
 
     return {"message": "Listing deleted successfully"}
 
-@app.get("/listing")
-def search_listings(db: MySQLConnection = Depends(get_db)):
-    try:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM listings")
-        rows = cursor.fetchall()
-        cursor.close()
-
-        return rows
-
-    except Exception as e:
-        print("ERROR IN /listing:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.patch("/listing/{listing_id}/a", response_model=ListingRead)
-def update_availability(
+@app.put("/listing/{listing_id}", response_model=ListingRead)
+def update_listing(
     listing_id: int,
-    available_from: Optional[date] = Query(None),
-    available_to: Optional[date] = Query(None),
-    status: Optional[str] = Query(None),
+    payload: ListingUpdate,
     db: MySQLConnection = Depends(get_db),
 ):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
-    existing = cursor.fetchone()
-    cursor.close()
+    raise HTTPException(status_code=501, detail="PUT not implemented yet")
 
-    if not existing:
-        raise HTTPException(status_code=404, detail="Listing not found")
-
-    fields = []
-    params: list = []
-
-    if available_from is not None:
-        fields.append("available_from = %s")
-        params.append(available_from)
-    if available_to is not None:
-        fields.append("available_to = %s")
-        params.append(available_to)
-    if status is not None:
-        fields.append("availability_status = %s")
-        params.append(status)
-
-    if fields:
-        sql = "UPDATE listings SET " + ", ".join(fields) + " WHERE id = %s"
-        params.append(listing_id)
-        cursor = db.cursor()
-        cursor.execute(sql, tuple(params))
-        db.commit()
-        cursor.close()
-
-    return get_listing(listing_id, db)
-
-
-@app.post("/listing/{listing_id}/images")
-def upload_images(
-    listing_id: int,
-    files: List[UploadFile] = File(...),
-    db: MySQLConnection = Depends(get_db),
-):
-    fake_urls = [f"https://example.com/images/{listing_id}/{f.filename}" for f in files]
-    return {"listing_id": listing_id, "uploaded": fake_urls}
+# -----------------------------------------------------------------------------
+# Root
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"message": "Listing Service"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
