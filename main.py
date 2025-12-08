@@ -1,12 +1,20 @@
 from typing import List, Optional
-from datetime import date
-from fastapi import FastAPI, Depends, HTTPException, Query, Path, UploadFile, File
+from datetime import date, datetime
+from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from mysql.connector import MySQLConnection
-from fastapi.encoders import jsonable_encoder
+import uuid
 
 from utils.database import get_db         
 from models.listing import ListingCreate, ListingRead, ListingUpdate
+from models.bulk_create import (
+    BulkListingCreate, 
+    BulkCreateTaskResponse, 
+    BulkCreateTaskStatus,
+    store_bulk_create_task, 
+    get_bulk_create_task,
+    process_bulk_create_listings
+)
 
 app = FastAPI(
     title="Listing Service",
@@ -79,8 +87,6 @@ def create_listing(
 
     return row_to_listing(row)
 
-from typing import List
-
 @app.get("/listing", response_model=List[ListingRead])
 async def search_listings(
     # ---- filters (all optional) ----
@@ -147,6 +153,32 @@ def list_listings_by_landlord(
 
     return [row_to_listing(r) for r in rows]
 
+@app.post("/listing/bulk-create", response_model=BulkCreateTaskResponse, status_code=202)
+async def bulk_create_listings(
+    payload: BulkListingCreate,
+    background_tasks: BackgroundTasks,
+):
+    """Create multiple listings asynchronously."""
+    task_id = str(uuid.uuid4())
+    
+    # Initialize and store task
+    task_status = BulkCreateTaskStatus(
+        task_id=task_id,
+        status="pending",
+        message=f"Bulk creation of {len(payload.listings)} listings queued",
+        created_at=datetime.now()
+    )
+    store_bulk_create_task(task_id, task_status)
+    
+    # Queue background processing
+    background_tasks.add_task(process_bulk_create_listings, task_id, payload.listings)
+    
+    return BulkCreateTaskResponse(
+        task_id=task_id,
+        status="pending",
+        message=f"Bulk creation started. Use GET /bulk-create/task/{task_id} to check progress."
+    )
+
 @app.delete("/listing/{listing_id}")
 def delete_listing(
     listing_id: int,
@@ -162,6 +194,14 @@ def delete_listing(
         raise HTTPException(status_code=404, detail="Listing not found")
 
     return {"message": "Listing deleted successfully"}
+
+@app.get("/bulk-create/task/{task_id}", response_model=BulkCreateTaskStatus)
+def get_bulk_create_task_status(task_id: str):
+    """Check the status of a bulk create task."""
+    task = get_bulk_create_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Bulk create task not found")
+    return task
 
 @app.put("/listing/{listing_id}", response_model=ListingRead)
 def update_listing(
