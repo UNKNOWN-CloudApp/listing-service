@@ -1,9 +1,20 @@
+import json
 from typing import List, Optional
 from datetime import date, datetime
-from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks, UploadFile, File
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from mysql.connector import MySQLConnection
 import uuid
+
+from pydantic import BaseModel
 
 from utils.database import get_db         
 from models.listing import ListingCreate, ListingRead, ListingUpdate
@@ -30,7 +41,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# helpers
+# -----------------------------------------------------------------------------
+# Hypermedia / Linked-data models
+# -----------------------------------------------------------------------------
+
+class ListingLinks(BaseModel):
+    self: str
+    landlord_listings: str
+
+
+class ListingWithLinks(BaseModel):
+    data: ListingRead
+    _links: ListingLinks
+
+
+class PaginatedLinks(BaseModel):
+    self: str
+    next: Optional[str] = None
+    prev: Optional[str] = None
+
+
+class PaginatedListingResponse(BaseModel):
+    items: List[ListingWithLinks]
+    page: int
+    page_size: int
+    _links: PaginatedLinks
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
 def row_to_listing(row: dict) -> ListingRead:
     """Convert a DB row from `listings` into ListingRead."""
     return ListingRead(
@@ -44,9 +83,52 @@ def row_to_listing(row: dict) -> ListingRead:
         picture_url=row.get("picture_url"),
     )
 
+def compute_etag_from_row(row: dict) -> str:
+    """
+    Compute a weak ETag from the DB row contents.
+
+    If you have an `updated_at` column you can simplify this to:
+        f'W/"{row["id"]}-{row["updated_at"].timestamp()}"'
+    """
+    # Only hash relevant fields to keep it stable and deterministic
+    payload = json.dumps(
+        {
+            "id": row["id"],
+            "landlord_email": row["landlord_email"],
+            "name": row["name"],
+            "address": row["address"],
+            "start_date": str(row["start_date"]) if row.get("start_date") else None,
+            "end_date": str(row["end_date"]) if row.get("end_date") else None,
+            "description": row.get("description"),
+            "picture_url": row.get("picture_url"),
+        },
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    md5_hex = hashlib.md5(payload).hexdigest()
+    return f'W/"{md5_hex}"'
+
+
+def listing_with_links(row: dict) -> ListingWithLinks:
+    """Wrap a DB row into ListingWithLinks with relative paths."""
+    listing = row_to_listing(row)
+    lid = listing.id
+    landlord = listing.landlord_email
+    return ListingWithLinks(
+        data=listing,
+        _links=ListingLinks(
+            self=f"/listing/{lid}",
+            landlord_listings=f"/listing/user/{landlord}",
+        ),
+    )
+
+# -----------------------------------------------------------------------------
+# POST /listing  (201 Created + Location)
+# -----------------------------------------------------------------------------
 @app.post("/listing", response_model=ListingRead, status_code=201)
 def create_listing(
     payload: ListingCreate,
+    response: Response,
     db: MySQLConnection = Depends(get_db),
 ):
     cursor = db.cursor()
@@ -85,9 +167,20 @@ def create_listing(
     row = cursor.fetchone()
     cursor.close()
 
+    # Set Location header to the new resource's relative URL
+    response.headers["Location"] = f"/listing/{new_id}"
+
+    # Also set ETag for the created resource
+    response.headers["ETag"] = compute_etag_from_row(row)
+
     return row_to_listing(row)
 
-@app.get("/listing", response_model=List[ListingRead])
+
+# -----------------------------------------------------------------------------
+# GET /listing  (collection with filters, pagination, linked data)
+# -----------------------------------------------------------------------------
+
+@app.get("/listing", response_model=PaginatedListingResponse)
 async def search_listings(
     # ---- filters (all optional) ----
     landlord_email: Optional[str] = Query(None),
@@ -100,10 +193,11 @@ async def search_listings(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
 
+    request: Request = None,
     db: MySQLConnection = Depends(get_db),
 ):
     sql = "SELECT * FROM listings WHERE 1=1"
-    params = []
+    params: List[object] = []
 
     # ---- dynamic filters ----
     if landlord_email:
@@ -123,7 +217,7 @@ async def search_listings(
         params.append(start_date)
 
     if end_date:
-        # if you want open-ended listings to still show, you can drop the IS NULL part
+        # If you want open-ended listings to still show, you can drop the IS NULL part
         sql += " AND (end_date IS NULL OR end_date <= %s)"
         params.append(end_date)
 
@@ -137,21 +231,86 @@ async def search_listings(
     rows = cursor.fetchall()
     cursor.close()
 
-    return [row_to_listing(row) for row in rows]
+    items = [listing_with_links(row) for row in rows]
 
-@app.get("/listing/user/{landlord_email}", response_model=List[ListingRead])
+    base_path = str(request.url.path)  # e.g. "/listing"
+    self_link = f"{base_path}?page={page}&page_size={page_size}"
+    next_link = (
+        f"{base_path}?page={page + 1}&page_size={page_size}"
+        if len(rows) == page_size
+        else None
+    )
+    prev_link = (
+        f"{base_path}?page={page - 1}&page_size={page_size}"
+        if page > 1
+        else None
+    )
+
+    return PaginatedListingResponse(
+        items=items,
+        page=page,
+        page_size=page_size,
+        _links=PaginatedLinks(
+            self=self_link,
+            next=next_link,
+            prev=prev_link,
+        ),
+    )
+
+
+# -----------------------------------------------------------------------------
+# GET /listing/user/{landlord_email}  (collection with query params + pagination)
+# -----------------------------------------------------------------------------
+
+@app.get("/listing/user/{landlord_email}", response_model=PaginatedListingResponse)
 def list_listings_by_landlord(
     landlord_email: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    request: Request = None,
     db: MySQLConnection = Depends(get_db),
 ):
+    offset = (page - 1) * page_size
+
     cursor = db.cursor(dictionary=True)
     cursor.execute(
-        "SELECT * FROM listings WHERE landlord_email = %s", (landlord_email,)
+        """
+        SELECT * FROM listings
+        WHERE landlord_email = %s
+        ORDER BY id DESC
+        LIMIT %s OFFSET %s
+        """,
+        (landlord_email, page_size, offset),
     )
     rows = cursor.fetchall()
     cursor.close()
 
-    return [row_to_listing(r) for r in rows]
+    items = [listing_with_links(r) for r in rows]
+
+    base_path = str(request.url.path)  # e.g. "/listing/user/foo@bar.com"
+    self_link = f"{base_path}?page={page}&page_size={page_size}"
+    next_link = (
+        f"{base_path}?page={page + 1}&page_size={page_size}"
+        if len(rows) == page_size
+        else None
+    )
+    prev_link = (
+        f"{base_path}?page={page - 1}&page_size={page_size}"
+        if page > 1
+        else None
+    )
+
+    return PaginatedListingResponse(
+        items=items,
+        page=page,
+        page_size=page_size,
+        _links=PaginatedLinks(
+            self=self_link,
+            next=next_link,
+            prev=prev_link,
+        ),
+    )
+
 
 @app.post("/listing/bulk-create", response_model=BulkCreateTaskResponse, status_code=202)
 async def bulk_create_listings(
@@ -179,6 +338,20 @@ async def bulk_create_listings(
         message=f"Bulk creation started. Use GET /bulk-create/task/{task_id} to check progress."
     )
 
+
+@app.get("/bulk-create/task/{task_id}", response_model=BulkCreateTaskStatus)
+def get_bulk_create_task_status(task_id: str):
+    """Check the status of a bulk create task."""
+    task = get_bulk_create_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Bulk create task not found")
+    return task
+
+
+# -----------------------------------------------------------------------------
+# DELETE /listing/{listing_id}
+# -----------------------------------------------------------------------------
+
 @app.delete("/listing/{listing_id}")
 def delete_listing(
     listing_id: int,
@@ -195,21 +368,76 @@ def delete_listing(
 
     return {"message": "Listing deleted successfully"}
 
-@app.get("/bulk-create/task/{task_id}", response_model=BulkCreateTaskStatus)
-def get_bulk_create_task_status(task_id: str):
-    """Check the status of a bulk create task."""
-    task = get_bulk_create_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Bulk create task not found")
-    return task
 
-@app.put("/listing/{listing_id}", response_model=ListingRead)
+# -----------------------------------------------------------------------------
+# PUT /listing/{listing_id}  (ETag via If-Match for concurrency control)
+# -----------------------------------------------------------------------------
+
+@app.put("/listing/{listing_id}", response_model=ListingWithLinks)
 def update_listing(
     listing_id: int,
     payload: ListingUpdate,
+    request: Request,
+    response: Response,
     db: MySQLConnection = Depends(get_db),
 ):
-    raise HTTPException(status_code=501, detail="PUT not implemented yet")
+    # 1. Get current row
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
+    current_row = cursor.fetchone()
+
+    if not current_row:
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    # 2. ETag concurrency check using If-Match
+    current_etag = compute_etag_from_row(current_row)
+    client_if_match = request.headers.get("if-match")
+
+    if client_if_match is not None and client_if_match != current_etag:
+        cursor.close()
+        raise HTTPException(
+            status_code=412,
+            detail="ETag mismatch: resource has changed on the server",
+        )
+
+    # 3. Build dynamic UPDATE based on provided fields
+    update_data = payload.model_dump(exclude_unset=True)
+    if not update_data:
+        # Nothing to update; just return current representation with ETag
+        cursor.close()
+        response.headers["ETag"] = current_etag
+        return listing_with_links(current_row)
+
+    set_clauses = []
+    params: List[object] = []
+
+    for col, value in update_data.items():
+        if col == "picture_url" and value is not None:
+            value = str(value)
+        set_clauses.append(f"{col} = %s")
+        params.append(value)
+
+    params.append(listing_id)
+    sql = f"UPDATE listings SET {', '.join(set_clauses)} WHERE id = %s"
+
+    cursor.execute(sql, tuple(params))
+    db.commit()
+    cursor.close()
+
+    # 4. Fetch the updated row
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
+    updated_row = cursor.fetchone()
+    cursor.close()
+
+    if not updated_row:
+        raise HTTPException(status_code=500, detail="Failed to fetch updated listing")
+
+    new_etag = compute_etag_from_row(updated_row)
+    response.headers["ETag"] = new_etag
+
+    return listing_with_links(updated_row)
 
 # -----------------------------------------------------------------------------
 # Root
