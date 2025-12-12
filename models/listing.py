@@ -50,20 +50,12 @@ class ListingCreate(ListingBase):
     )
 
 
-class ListingUpdate(BaseModel):
+class ListingUpdate(ListingBase):
     """
     Payload for PUT /listing/{listing_id}.
-    You said PUT is not implemented yet (501), but when you do implement it,
-    this model lets you do full or partial updates.
+    All fields optional; missing fields keep previous values in the PUT handler.
     """
-
-    landlord_email: Optional[EmailStr] = None
-    name: Optional[str] = None
-    address: Optional[str] = None
-    start_date: Optional[datetime] = None
-    end_date: Optional[datetime] = None
-    description: Optional[str] = None
-    picture_url: Optional[AnyHttpUrl] = None
+    pass
 
 
 class ListingRead(ListingBase):

@@ -370,74 +370,68 @@ def delete_listing(
 
 
 # -----------------------------------------------------------------------------
-# PUT /listing/{listing_id}  (ETag via If-Match for concurrency control)
+# PUT /listing/{listing_id}
 # -----------------------------------------------------------------------------
 
-@app.put("/listing/{listing_id}", response_model=ListingWithLinks)
+@app.put("/listing/{listing_id}", response_model=ListingRead)
 def update_listing(
     listing_id: int,
     payload: ListingUpdate,
-    request: Request,
-    response: Response,
     db: MySQLConnection = Depends(get_db),
 ):
-    # 1. Get current row
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
-    current_row = cursor.fetchone()
 
-    if not current_row:
+    # 1. Fetch existing listing
+    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
+    row = cursor.fetchone()
+    if not row:
         cursor.close()
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    # 2. ETag concurrency check using If-Match
-    current_etag = compute_etag_from_row(current_row)
-    client_if_match = request.headers.get("if-match")
+    # 2. Use new values if provided, otherwise keep old ones
+    name = payload.name if payload.name is not None else row["name"]
+    address = payload.address if payload.address is not None else row["address"]
+    start_date = payload.start_date if payload.start_date is not None else row["start_date"]
+    end_date = payload.end_date if payload.end_date is not None else row["end_date"]
+    description = payload.description if payload.description is not None else row["description"]
+    picture_url = (
+        str(payload.picture_url)
+        if payload.picture_url is not None
+        else row["picture_url"]
+    )
 
-    if client_if_match is not None and client_if_match != current_etag:
-        cursor.close()
-        raise HTTPException(
-            status_code=412,
-            detail="ETag mismatch: resource has changed on the server",
-        )
-
-    # 3. Build dynamic UPDATE based on provided fields
-    update_data = payload.model_dump(exclude_unset=True)
-    if not update_data:
-        # Nothing to update; just return current representation with ETag
-        cursor.close()
-        response.headers["ETag"] = current_etag
-        return listing_with_links(current_row)
-
-    set_clauses = []
-    params: List[object] = []
-
-    for col, value in update_data.items():
-        if col == "picture_url" and value is not None:
-            value = str(value)
-        set_clauses.append(f"{col} = %s")
-        params.append(value)
-
-    params.append(listing_id)
-    sql = f"UPDATE listings SET {', '.join(set_clauses)} WHERE id = %s"
-
-    cursor.execute(sql, tuple(params))
+    # 3. Single static UPDATE
+    cursor.execute(
+        """
+        UPDATE listings
+        SET
+            name = %s,
+            address = %s,
+            start_date = %s,
+            end_date = %s,
+            description = %s,
+            picture_url = %s
+        WHERE id = %s
+        """,
+        (
+            name,
+            address,
+            start_date,
+            end_date,
+            description,
+            picture_url,
+            listing_id,
+        ),
+    )
     db.commit()
-    cursor.close()
 
-    # 4. Fetch the updated row
-    cursor = db.cursor(dictionary=True)
+    # 4. Fetch updated row
     cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
     updated_row = cursor.fetchone()
     cursor.close()
 
-    if not updated_row:
-        raise HTTPException(status_code=500, detail="Failed to fetch updated listing")
+    return row_to_listing(updated_row)
 
-    new_etag = compute_etag_from_row(updated_row)
-    response.headers["ETag"] = new_etag
-
-    return listing_with_links(updated_row)
 
 # -----------------------------------------------------------------------------
 # Root
