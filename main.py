@@ -186,6 +186,7 @@ async def search_listings(
     landlord_email: Optional[str] = Query(None),
     name: Optional[str] = Query(None),
     address: Optional[str] = Query(None),
+    description: Optional[str] = Query(None),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
 
@@ -211,6 +212,10 @@ async def search_listings(
     if address:
         sql += " AND address LIKE %s"
         params.append(f"%{address}%")
+    
+    if description:
+        sql += " AND description LIKE %s"
+        params.append(f"%{description}%")
 
     if start_date:
         sql += " AND start_date >= %s"
@@ -256,61 +261,6 @@ async def search_listings(
             prev=prev_link,
         ),
     )
-
-
-# -----------------------------------------------------------------------------
-# GET /listing/user/{landlord_email}  (collection with query params + pagination)
-# -----------------------------------------------------------------------------
-
-@app.get("/listing/user/{landlord_email}", response_model=PaginatedListingResponse)
-def list_listings_by_landlord(
-    landlord_email: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-    request: Request = None,
-    db: MySQLConnection = Depends(get_db),
-):
-    offset = (page - 1) * page_size
-
-    cursor = db.cursor(dictionary=True)
-    cursor.execute(
-        """
-        SELECT * FROM listings
-        WHERE landlord_email = %s
-        ORDER BY id DESC
-        LIMIT %s OFFSET %s
-        """,
-        (landlord_email, page_size, offset),
-    )
-    rows = cursor.fetchall()
-    cursor.close()
-
-    items = [listing_with_links(r) for r in rows]
-
-    base_path = str(request.url.path)  # e.g. "/listing/user/foo@bar.com"
-    self_link = f"{base_path}?page={page}&page_size={page_size}"
-    next_link = (
-        f"{base_path}?page={page + 1}&page_size={page_size}"
-        if len(rows) == page_size
-        else None
-    )
-    prev_link = (
-        f"{base_path}?page={page - 1}&page_size={page_size}"
-        if page > 1
-        else None
-    )
-
-    return PaginatedListingResponse(
-        items=items,
-        page=page,
-        page_size=page_size,
-        _links=PaginatedLinks(
-            self=self_link,
-            next=next_link,
-            prev=prev_link,
-        ),
-    )
-
 
 @app.post("/listing/bulk-create", response_model=BulkCreateTaskResponse, status_code=202)
 async def bulk_create_listings(
