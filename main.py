@@ -261,6 +261,20 @@ async def search_listings(
             prev=prev_link,
         ),
     )
+# -----------------------------------------------------------------------------
+# GET /listing/{listing_id}
+# -----------------------------------------------------------------------------
+@app.get("/listing/{listing_id}", response_model=ListingRead)
+def get_listing(listing_id: int, db: MySQLConnection = Depends(get_db)):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
+    row = cursor.fetchone()
+    cursor.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    return row_to_listing(row)
 
 @app.post("/listing/bulk-create", response_model=BulkCreateTaskResponse, status_code=202)
 async def bulk_create_listings(
