@@ -1,3 +1,4 @@
+import hashlib
 import json
 from typing import List, Optional
 from datetime import date, datetime
@@ -131,6 +132,12 @@ def create_listing(
     response: Response,
     db: MySQLConnection = Depends(get_db),
 ):
+    if payload.start_date >= payload.end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Start date must be before end date"
+        )
+
     cursor = db.cursor()
 
     sql = """
