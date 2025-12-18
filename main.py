@@ -224,13 +224,25 @@ async def search_listings(
         sql += " AND description LIKE %s"
         params.append(f"%{description}%")
 
-    if start_date:
-        sql += " AND start_date >= %s"
+    # ---- date filters (range containment) ----
+    if start_date and end_date:
+        if start_date > end_date:
+            raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+        sql += " AND start_date <= %s"
         params.append(start_date)
 
-    if end_date:
-        # If you want open-ended listings to still show, you can drop the IS NULL part
-        sql += " AND (end_date IS NULL OR end_date <= %s)"
+        sql += " AND (end_date IS NULL OR end_date >= %s)"
+        params.append(end_date)
+
+    elif start_date:
+        # any listing that hasn't started after the requested start
+        sql += " AND start_date <= %s"
+        params.append(start_date)
+
+    elif end_date:
+        # any listing that doesn't end before the requested end
+        sql += " AND (end_date IS NULL OR end_date >= %s)"
         params.append(end_date)
 
     # ---- pagination ----
