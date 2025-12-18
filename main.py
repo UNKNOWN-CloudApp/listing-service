@@ -269,10 +269,19 @@ async def search_listings(
         ),
     )
 # -----------------------------------------------------------------------------
-# GET /listing/{listing_id}
+# GET /listing/{listing_id}  (ETag + If-None-Match => 304)
 # -----------------------------------------------------------------------------
-@app.get("/listing/{listing_id}", response_model=ListingRead)
-def get_listing(listing_id: int, db: MySQLConnection = Depends(get_db)):
+@app.get(
+    "/listing/{listing_id}",
+    response_model=ListingRead,
+    responses={304: {"description": "Not Modified"}},
+)
+def get_listing(
+    listing_id: int,
+    request: Request,
+    response: Response,
+    db: MySQLConnection = Depends(get_db),
+):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM listings WHERE id = %s", (listing_id,))
     row = cursor.fetchone()
@@ -280,6 +289,16 @@ def get_listing(listing_id: int, db: MySQLConnection = Depends(get_db)):
 
     if not row:
         raise HTTPException(status_code=404, detail="Listing not found")
+
+    etag = compute_etag_from_row(row)
+
+    # Always send the current ETag (including on 304)
+    response.headers["ETag"] = etag
+
+    inm = request.headers.get("if-none-match")
+    if inm and inm.strip() == etag:
+        # IMPORTANT: return a Response object so FastAPI does NOT try to validate a body
+        return Response(status_code=304, headers={"ETag": etag})
 
     return row_to_listing(row)
 
